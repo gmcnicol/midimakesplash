@@ -1,0 +1,531 @@
+// MIT License
+//
+// Copyright (c) Gareth McNicol
+//
+// Permission is hereby granted, free of charge, to any person obtaining a copy
+// of this software and associated documentation files (the "Software"), to deal
+// in the Software without restriction, including without limitation the rights
+// to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+// copies of the Software, and to permit persons to whom the Software is
+// furnished to do so, subject to the following conditions:
+//
+// The above copyright notice and this permission notice shall be included in all
+// copies or substantial portions of the Software.
+//
+// THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+// IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+// FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+// AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+// LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+// OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+// SOFTWARE.
+//
+// WaterSplash2
+// Summary: MIDI impacts spawn gravity-timed droplets; notes are picked around anchor then snapped (SnapToKey-style) before send.
+
+// Overflow: DropNewest (skip scheduling when queue full)
+// Determinism: Lock Seed resets RNG on play/seed change
+// Known limits: No tempo sync, simple channel spread, no UI beyond sliders
+// TODO: Add more modes/scales (harmonic minor, pentatonic).
+// TODO: Add a "Vortex" control (spiral outward then return).
+// TODO: Export droplet stream to log for later fitness evaluation.
+
+desc:MIDI Makes Notes Splash
+
+in_pin:none
+out_pin:none
+
+slider1:0<0,11,1{C,C#,D,D#,E,F,F#,G,G#,A,A#,B}>Root
+slider3:/scales:2:Scale File
+slider4:0<0,1,1{NearestInScale,RequireInScale}>Anchor Policy
+slider5:36<0,127,1>Pitch Clamp Low
+slider6:60<0,127,1>Pitch Clamp High
+
+slider10:0<0,1,1>-Gap A-B
+
+slider11:3000<0,3000,1>Base Droplets
+slider12:100<0,100,1>Impact->Droplets (%)
+slider13:12<0,36,1>Spray Radius (degrees)
+slider14:0<-100,100,1>Up/Down Bias
+slider15:0<0,16,1>Channel Spread
+slider16:5<0,10000,1>Min Flight (ms)
+slider17:20000<1,20000,1>Max Flight (ms)
+slider18:50<0,100,1>Gravity
+slider19:8<0,100,1>Turbulence (ms)
+slider20:10<0,100,1>Clumpiness
+
+slider23:0<0,1,1>-Gap B-C
+
+slider24:75<0,100,1>Velocity<->Flight
+slider25:30<0,100,1>Distance Damping
+slider26:8<1,127,1>Min Velocity
+slider27:127<1,127,1>Max Velocity
+slider28:1<0.25,32,0.25>Min Drop Length (eighths; later drops shrink)
+slider29:100<10,20000,1>Max Drop Length (ms)
+
+slider32:0<0,1,1>-Gap C-D
+
+slider33:0<0,1,1>Pass Through Input
+slider34:0<0,1,1>New Impact Cancels Tail
+slider35:0<0,50,1>Feedback (%)
+slider36:5<3,6,1>Max Regen Depth
+slider37:12345<0,999999,1>Seed
+slider38:1<0,1,1>Lock Seed
+
+@init
+  MAX_EVENTS = 16384;
+  EV_TIME   = 0;
+  EV_NOTE   = EV_TIME + MAX_EVENTS;
+  EV_VEL    = EV_NOTE + MAX_EVENTS;
+  EV_CHAN   = EV_VEL + MAX_EVENTS;
+  EV_TYPE   = EV_CHAN + MAX_EVENTS; // 0 on, 1 off
+  EV_ACTIVE = EV_TYPE + MAX_EVENTS;
+
+  CLUMP_BASE  = EV_ACTIVE + MAX_EVENTS;   // up to 16 centers
+  ACTIVE_BASE = CLUMP_BASE + 16;          // 16 * 128 active map
+  VALID_BASE  = ACTIVE_BASE + 16 * 128;   // 128 mask entries (unused but reserved)
+  VALID_LIST  = VALID_BASE + 128;         // 128 note slots (unused but reserved)
+  SCALE_BASE  = VALID_LIST + 128;         // up to 16 scale degrees from file
+  FB_MAX      = 64;
+  FB_NOTE     = SCALE_BASE + 16;          // 64 notes
+  FB_VEL      = FB_NOTE + FB_MAX;         // 64 velocities
+  FB_CHAN     = FB_VEL + FB_MAX;          // 64 channels
+  FB_POS      = FB_CHAN + FB_MAX;         // 64 positions (samples rel to now_abs)
+  FB_BASE     = FB_POS + FB_MAX;          // 64 base droplet counts
+  FB_DEPTH    = FB_BASE + FB_MAX;         // 64 depths
+  MEM_END     = FB_DEPTH + FB_MAX;
+
+  i = 0;
+  while (i < MEM_END) (mem[i] = 0; i += 1;);
+
+  ev_insert = 0;
+  ev_count = 0;
+  now_abs = 0;
+
+  gravity_exp_min = 0.6;
+  gravity_exp_max = 6.0;
+  vel_exp_min = 0.6;
+  vel_exp_max = 4.0;
+
+  rng_state = slider37;
+  last_seed = slider37;
+  last_lock = slider38 >= 0.5;
+  last_play_state = play_state;
+  prev_scale_path = -1;
+  last_impact_note = -1;
+  scale_size = 0;
+  scale_error = 0;
+
+  function load_scale()
+    local(h i)
+    (
+      scale_size = 0;
+      scale_error = 0;
+      h = file_open(slider3);
+      h > 0 ? (
+        file_text(h);
+        i = 0;
+        while (i < 16 && file_var(h, mem[SCALE_BASE + i])) (
+          i += 1;
+        );
+        file_close(h);
+        scale_size = i;
+      ) : 0;
+      scale_size <= 0 ? scale_error = 1 : 0;
+    );
+
+@slider
+  // Keep min/max slider pairs valid at the UI layer.
+  clamp_lo = min(slider5, slider6);
+  clamp_hi = max(slider5, slider6);
+  slider5 = clamp_lo;
+  slider6 = clamp_hi;
+
+  flight_lo = min(slider16, slider17);
+  flight_hi = max(slider16, slider17);
+  slider16 = flight_lo;
+  slider17 = flight_hi;
+
+  vel_lo = min(slider26, slider27);
+  vel_hi = max(slider26, slider27);
+  slider26 = vel_lo;
+  slider27 = vel_hi;
+
+  // Note length min is in eighth-notes, max is ms; clamp using current tempo.
+  tempo_bpm = tempo > 0 ? tempo : 120;
+  eighth_ms = 60000 / (tempo_bpm * 2);
+  max_eighths = floor((20000 / eighth_ms) * 4) / 4;
+  max_eighths < 0.25 ? max_eighths = 0.25 : 0;
+  max_eighths > 32 ? max_eighths = 32 : 0;
+
+  slider28 < 0.25 ? slider28 = 0.25 : 0;
+  slider28 > max_eighths ? slider28 = max_eighths : 0;
+
+  min_note_len_ms = max(10, slider28 * eighth_ms);
+  slider29 < min_note_len_ms ? slider29 = min_note_len_ms : 0;
+  slider29 > 20000 ? slider29 = 20000 : 0;
+
+  prev_scale_path != slider3 ? (
+    load_scale();
+    prev_scale_path = slider3;
+  ) : 0;
+
+@block
+  function reflect_into_range(n lo hi)
+  local(span)
+  (
+    span = hi - lo;
+    span <= 0 ? (
+      n = lo;
+    ) : (
+      while (n < lo || n > hi) (
+        n < lo ? (n = lo + (lo - n)) : (n = hi - (n - hi));
+      );
+    );
+    reflect_into_range = n;
+  );
+
+  function clamp_val(v lo hi)
+    ( v < lo ? lo : v > hi ? hi : v; );
+
+  function rand_unit()
+    ( rng_state = (rng_state * 1664525 + 1013904223) & 0x7fffffff;
+      rand_unit = rng_state / 2147483647.0; );
+
+  function is_mode_note(n)
+    local(rel i result)
+    ( rel = (n - root_note) % 12;
+      rel < 0 ? rel += 12 : 0;
+      result = 0;
+      i = 0;
+      while (i < scale_size && !result) (
+        mem[SCALE_BASE + i] == rel ? result = 1 : 0;
+        i += 1;
+      );
+      result;
+    );
+
+  function build_valid_mask()
+    ( build_valid_mask = 0; );
+
+  function snap_to_scale(n)
+    local(center down up found result)
+    (
+      result = clamp_val(floor(n + 0.5), clamp_low, clamp_high);
+
+      scale_size > 0 && !is_mode_note(result) ? (
+        center = result;
+        found = -1;
+        down = center - 1;
+        up = center + 1;
+        while (found < 0 && (down >= clamp_low || up <= clamp_high)) (
+          down >= clamp_low ? (
+            is_mode_note(down) ? found = down : 0;
+            down -= 1;
+          ) : 0;
+
+          found < 0 && up <= clamp_high ? (
+            is_mode_note(up) ? found = up : 0;
+            up += 1;
+          ) : 0;
+        );
+        found >= 0 ? result = found : 0;
+      );
+
+      result;
+    );
+
+  function pick_note(anchor_note phase)
+    local(span radius offset prob_up sign candidate scale_factor)
+    (
+      span = 128;
+      radius = radius_deg;
+      radius < 1 ? radius = 1 : 0;
+      
+      bell=4*phase*(1-phase); // 0..1..0
+      scale_factor = 0.2 + 1.2 * pow(bell, 0.9);
+      offset = floor(pow(rand_unit(), 1.6) * radius * scale_factor + 0.5);
+      offset < 1 ? offset = 1 : 0;
+      prob_up = 0.5 + updown_bias_val * 0.005;
+      prob_up = clamp_val(prob_up, 0, 1);
+      sign = rand_unit() < prob_up ? 1 : -1;
+      candidate = anchor_note + sign * offset;
+      candidate < 0 ? candidate = (candidate % 128 + 128) % 128 : 0;
+      candidate > 127 ? candidate = candidate % 128 : 0;
+      pick_note = clamp_val(candidate, 0, 127);
+    );
+
+  function queue_event(t_abs note vel chan type)
+    local(idx tries)
+    ( queue_event = 0;
+      ev_count >= MAX_EVENTS ? 0 : (
+        idx = ev_insert;
+        tries = 0;
+        while (tries < MAX_EVENTS && mem[EV_ACTIVE + idx]) (
+          idx = (idx + 1) % MAX_EVENTS;
+          tries += 1;
+        );
+        tries < MAX_EVENTS && !mem[EV_ACTIVE + idx] ? (
+          mem[EV_TIME + idx] = t_abs;
+          mem[EV_NOTE + idx] = note;
+          mem[EV_VEL + idx] = vel;
+          mem[EV_CHAN + idx] = chan;
+          mem[EV_TYPE + idx] = type;
+          mem[EV_ACTIVE + idx] = 1;
+          ev_count += 1;
+          ev_insert = (idx + 1) % MAX_EVENTS;
+          queue_event = 1;
+        ) : 0;
+      );
+    );
+
+  function flush_tail()
+    local(i idx note chan)
+    (
+      i = 0;
+      while (i < MAX_EVENTS) (
+        mem[EV_ACTIVE + i] = 0;
+        i += 1;
+      );
+      ev_count = 0;
+      ev_insert = 0;
+
+      idx = 0;
+      while (idx < 16 * 128) (
+        mem[ACTIVE_BASE + idx] ? (
+          chan = floor(idx / 128);
+          note = idx - chan * 128;
+          midisend(0, 0x80 | chan, note);
+          mem[ACTIVE_BASE + idx] = 0;
+        ) : 0;
+        idx += 1;
+      );
+    );
+
+  function anchor_from_impact(n)
+    (
+      anchor_from_impact = -1;
+      anchor_policy == 1 && !is_mode_note(n) ? (
+        anchor_from_impact = -1;
+      ) : (
+        anchor_from_impact = snap_to_scale(n);
+        anchor_from_impact = clamp_val(anchor_from_impact, clamp_low, clamp_high);
+      );
+    );
+
+  function spawn_droplets(impact_note impact_vel impact_chan impact_pos)
+    local(queue_start queue_end anchor total extra clump_pull clump_count c center u flight_range_ms flight_ms phase target_note snapped dist_norm vel_out flight_samples on_time off_time chan_out jitter nearest mindist i len_ms len_spl regen_base cur_base cur_note cur_vel cur_chan cur_pos cur_depth)
+    (
+      !(scale_error || (scale_size <= 0)) ? (
+        queue_start = 0;
+        queue_end = 0;
+        mem[FB_NOTE + queue_end] = impact_note;
+        mem[FB_VEL + queue_end] = impact_vel;
+        mem[FB_CHAN + queue_end] = impact_chan;
+        mem[FB_POS + queue_end] = impact_pos;
+        mem[FB_BASE + queue_end] = base_droplets_val;
+        mem[FB_DEPTH + queue_end] = 0;
+        queue_end += 1;
+
+        while (queue_start < queue_end) (
+        cur_note = mem[FB_NOTE + queue_start];
+        cur_vel  = mem[FB_VEL + queue_start];
+        cur_chan = mem[FB_CHAN + queue_start];
+        cur_pos  = mem[FB_POS + queue_start];
+        cur_base = mem[FB_BASE + queue_start];
+        cur_depth = mem[FB_DEPTH + queue_start];
+        queue_start += 1;
+
+        anchor = anchor_from_impact(cur_note);
+        anchor < 0 ? (continue;);
+
+        total = cur_base;
+        extra = floor((cur_vel / 127.0) * impact_extra_ratio * cur_base + 0.0001);
+        total += extra;
+        total < 0 ? total = 0 : 0;
+        total > 4096 ? total = 4096 : 0; // safety ceiling per splash
+
+        clump_pull = clumpiness_val / 100.0;
+        clump_count = 0;
+        flight_range_ms = max_flight_ms - min_flight_ms;
+        flight_range_ms <= 0 ? flight_range_ms = 1 : 0;
+
+        clump_pull > 0 ? (
+          clump_count = 2 + floor(rand_unit() * 5);
+          c = 0;
+          while (c < clump_count) (
+            u = rand_unit();
+            center = min_flight_ms + pow(u, gravity_exp * 1.3) * flight_range_ms;
+            mem[CLUMP_BASE + c] = center;
+            c += 1;
+          );
+        ) : 0;
+
+        i = 0;
+        while (i < total) (
+          ev_count > (MAX_EVENTS - 2) ? (break;); // ensure we can schedule on+off as a pair
+          u = rand_unit();
+          flight_ms = min_flight_ms + pow(u, gravity_exp) * flight_range_ms;
+          clump_count > 0 && (rand_unit() < clump_pull) ? (
+            nearest = 0;
+            mindist = abs(flight_ms - mem[CLUMP_BASE]);
+            c = 1;
+            while (c < clump_count) (
+              abs(flight_ms - mem[CLUMP_BASE + c]) < mindist ? (
+                mindist = abs(flight_ms - mem[CLUMP_BASE + c]);
+                nearest = c;
+              ) : 0;
+              c += 1;
+            );
+            jitter = (rand_unit() * 2 - 1) * (turbulence_ms * 0.5);
+            flight_ms += (mem[CLUMP_BASE + nearest] + jitter - flight_ms) * clump_pull;
+          ) : 0;
+
+          flight_ms += (rand_unit() * 2 - 1) * turbulence_ms;
+          flight_ms = clamp_val(flight_ms, min_flight_ms, max_flight_ms);
+
+          phase = (flight_ms - min_flight_ms) / flight_range_ms;
+          phase = clamp_val(phase, 0, 1);
+
+          target_note = pick_note(anchor, phase);
+          target_note = reflect_into_range(target_note, clamp_low, clamp_high);
+          snapped = snap_to_scale(target_note);
+          !is_mode_note(snapped) ? snapped = anchor : 0;
+
+          dist_norm = (clamp_high > clamp_low) ? abs(snapped - anchor) / (clamp_high - clamp_low) : 0;
+          vel_out = cur_vel * pow(1 - phase, vel_exp);
+          vel_out *= (1 - dist_norm * (distance_damp_val / 100.0));
+          vel_out = clamp_val(vel_out, vel_floor_val, vel_ceil_val);
+          vel_out = clamp_val(vel_out, 1, 127);
+          vel_out = floor(vel_out + 0.5);
+
+          flight_samples = flight_ms * srate * 0.001;
+          flight_samples < 1 ? flight_samples = 1 : 0;
+          on_time = now_abs + cur_pos + flight_samples;
+          len_ms = min_note_len_ms + rand_unit() * (note_len_max_ms - min_note_len_ms);
+          len_ms < min_note_len_ms ? len_ms = min_note_len_ms : 0;
+          len_ms = floor(len_ms + 0.5); // quantize to 1 ms steps
+          len_spl = len_ms * srate * 0.001;
+          len_spl < 1 ? len_spl = 1 : 0;
+          off_time = on_time + len_spl;
+
+          chan_out = channel_spread_val > 0 ? (cur_chan + (i % channel_spread_val)) % 16 : cur_chan;
+
+          queue_event(on_time, snapped, vel_out, chan_out, 0) ? (
+            queue_event(off_time, snapped, 0, chan_out, 1);
+          ) : 0;
+
+          // Feedback queue: push diminished splash if probability hits and queue not full.
+          regen_base = floor(cur_base / phi);
+          (feedback_prob > 0) && (regen_base > 1) && (cur_depth < regen_max) && (queue_end < FB_MAX) && (ev_count < (MAX_EVENTS - guard_margin)) && (rand_unit() * 100 < feedback_prob) ? (
+            mem[FB_NOTE + queue_end] = snapped;
+            mem[FB_VEL + queue_end] = vel_out;
+            mem[FB_CHAN + queue_end] = chan_out;
+            mem[FB_POS + queue_end] = on_time - now_abs;
+            mem[FB_BASE + queue_end] = regen_base;
+            mem[FB_DEPTH + queue_end] = cur_depth + 1;
+            queue_end += 1;
+          ) : 0;
+
+          i += 1;
+        );
+        );
+      ) : 0;
+    );
+
+  // Slider reads.
+  root_note = clamp_val(floor(slider1 + 0.5), 0, 11);
+  anchor_policy = slider4 >= 0.5 ? 1 : 0;
+
+  clamp_low = clamp_val(floor(min(slider5, slider6) + 0.5), 0, 127);
+  clamp_high = clamp_val(floor(max(slider5, slider6) + 0.5), clamp_low, 127);
+
+  base_droplets_val = clamp_val(floor(slider11 + 0.5), 0, 3000);
+  guard_margin = clamp_val(floor(base_droplets_val * 2 + 0.5), 64, 1024);
+  impact_extra_ratio = clamp_val(slider12, 0, 100) / 100.0;
+  radius_deg = clamp_val(floor(slider13 + 0.5), 0, 36);
+  updown_bias_val = clamp_val(slider14, -100, 100);
+  channel_spread_val = clamp_val(floor(slider15 + 0.5), 0, 16);
+
+  min_flight_ms = clamp_val(slider16, 0, 500);
+  max_flight_ms = clamp_val(slider17, 1, 20000);
+  max_flight_ms <= min_flight_ms ? max_flight_ms = min_flight_ms + 1 : 0;
+  gravity_amt = clamp_val(slider18, 0, 100);
+  turbulence_ms = clamp_val(slider19, 0, 100);
+  clumpiness_val = clamp_val(slider20, 0, 100);
+
+  vel_link = clamp_val(slider24, 0, 100);
+  distance_damp_val = clamp_val(slider25, 0, 100);
+  vel_floor_val = clamp_val(floor(slider26 + 0.5), 1, 127);
+  vel_ceil_val = clamp_val(floor(slider27 + 0.5), 1, 127);
+  vel_floor_val > vel_ceil_val ? vel_floor_val = vel_ceil_val : 0;
+  tempo_bpm = tempo > 0 ? tempo : 120;
+  eighth_ms = 60000 / (tempo_bpm * 2);
+  min_eighths = clamp_val(slider28, 0.25, 32);
+  min_note_len_ms = max(10, min_eighths * eighth_ms);
+  note_len_max_ms = clamp_val(slider29, min_note_len_ms, 20000);
+  note_len_max_ms < min_note_len_ms ? note_len_max_ms = min_note_len_ms : 0;
+
+  pass_through = slider33 >= 0.5;
+  cancel_tail = slider34 >= 0.5;
+  seed_val = clamp_val(floor(slider37 + 0.5), 0, 999999);
+  lock_seed = slider38 >= 0.5;
+  feedback_prob = clamp_val(slider35, 0, 100);
+  regen_max = clamp_val(floor(slider36 + 0.5), 3, 6);
+
+  gravity_exp = gravity_exp_min + (gravity_amt / 100.0) * (gravity_exp_max - gravity_exp_min);
+  vel_exp = vel_exp_min + (vel_link / 100.0) * (vel_exp_max - vel_exp_min);
+
+  (lock_seed && (play_state == 1) && (last_play_state != 1)) ? rng_state = seed_val : 0;
+  (lock_seed && (seed_val != last_seed)) ? rng_state = seed_val : 0;
+  (!last_lock && lock_seed) ? rng_state = seed_val : 0;
+  last_seed = seed_val;
+  last_lock = lock_seed;
+  last_play_state = play_state;
+
+  block_start = now_abs;
+  block_end = now_abs + samplesblock;
+
+  while (midirecv(msgpos, msg1, msg23)) (
+    status = msg1 & 0xF0;
+    chan = msg1 & 0x0F;
+
+    pass_through ? midisend(msgpos, msg1, msg23) : 0;
+
+    (status == 0x90) && ((msg23 >> 8) & 0x7F) > 0 ? (
+      in_note = msg23 & 0x7F;
+      in_vel = (msg23 >> 8) & 0x7F;
+      last_impact_note = in_note;
+      cancel_tail ? flush_tail() : 0;
+      spawn_droplets(in_note, in_vel, chan, msgpos);
+    ) : 0;
+  );
+
+  i = 0;
+  while (i < MAX_EVENTS) (
+    mem[EV_ACTIVE + i] ? (
+      mem[EV_TIME + i] < block_end ? (
+        offs = mem[EV_TIME + i] - block_start;
+        offs < 0 ? offs = 0 : 0;
+        note = mem[EV_NOTE + i];
+        vel = mem[EV_VEL + i];
+        chan = mem[EV_CHAN + i];
+        type = mem[EV_TYPE + i];
+        type == 0 ? (
+          msg1 = 0x90 | chan;
+          msg23 = note | (vel << 8);
+          mem[ACTIVE_BASE + chan * 128 + note] = 1;
+        ) : (
+          msg1 = 0x80 | chan;
+          msg23 = note;
+          mem[ACTIVE_BASE + chan * 128 + note] = 0;
+        );
+        midisend(offs, msg1, msg23);
+        mem[EV_ACTIVE + i] = 0;
+        ev_count -= 1;
+      ) : 0;
+    ) : 0;
+    i += 1;
+  );
+
+  now_abs += samplesblock;
